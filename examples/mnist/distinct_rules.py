@@ -188,7 +188,7 @@ def is_apical_connection(conn):
         
     return False
 
-# 标记所有连接的突触类型
+
 for conn_name in network.connections:
     conn = network.connections[conn_name]
     conn.synapse_type = 'apical' if is_apical_connection(conn) else 'basal'
