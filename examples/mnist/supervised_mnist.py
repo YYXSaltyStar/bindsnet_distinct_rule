@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=64)
 
-    parser.set_defaults(plot=True, gpu=True, train=True)
+    parser.set_defaults(plot=False, gpu=True, train=True)
 
     args = parser.parse_args()
 

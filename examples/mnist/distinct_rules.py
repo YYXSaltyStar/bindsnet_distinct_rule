@@ -17,10 +17,11 @@ from bindsnet.analysis.plotting import (
     plot_voltages,
     plot_weights,
 )
+from bindsnet.network import Network
+from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.datasets import MNIST
 from bindsnet.encoding import PoissonEncoder
 from bindsnet.evaluation import all_activity, assign_labels, proportion_weighting
-from bindsnet.models import DiehlAndCook2015
 from bindsnet.network.monitors import Monitor
 from bindsnet.utils import get_square_assignments, get_square_weights
 #设定了以下一系列的参数命令行解释器，default代表了默认值。之后，我们可以在命令行中定义它们的值。
@@ -112,17 +113,44 @@ start_intensity = intensity
 per_class = int(n_neurons / n_classes)
 
 # Build Diehl & Cook 2015 network.
-network = DiehlAndCook2015(
-    n_inpt=784,
-    n_neurons=n_neurons,
-    exc=exc,
-    inh=inh,
-    dt=dt,
-    nu=[1e-10, 1e-3],
-    norm=78.4,
-    theta_plus=theta_plus,
-    inpt_shape=(1, 28, 28)  # 保留原始参数
+network = Network()
+input_layer = Input(n=784, shape=(1,28,28), traces=True)
+ae_layer = LIFNodes(
+    n=100, 
+    thresh=-52.0, 
+    rest=-65.0,
+    traces=True,
+    tc_decay=100.0  # 电压衰减时间常数
 )
+
+# 添加层到网络[1,2](@ref)
+network.add_layer(input_layer, name="X")
+network.add_layer(ae_layer, name="Ae")
+
+# 创建前馈连接（输入层到兴奋层）
+feedforward_conn = Connection(
+    source=input_layer, 
+    target=ae_layer,
+    w=0.05 + 0.1 * torch.randn(784, 100),  
+    wmin=0.0, 
+    wmax=100.0,
+    update_rule=None,       
+)
+
+# 创建循环连接（兴奋层内部）
+recurrent_conn = Connection(
+    source=ae_layer,
+    target=ae_layer,
+    w=0.025 * (torch.eye(100) - 1),  # 对角抑制权重
+    wmin=-120.0, 
+    wmax=0.0,
+    update_rule=PostPre,  # STDP学习规则[7](@ref)
+    nu=[1e-4, 1e-2]
+)
+
+# 添加连接到网络[6](@ref)
+network.add_connection(feedforward_conn, "X", "Ae")
+network.add_connection(recurrent_conn, "Ae", "Ae")
 
 print("网络层信息:")
 for layer_name in network.layers:
@@ -174,9 +202,7 @@ if gpu:
 # Voltage recording for excitatory and inhibitory layers.
 #兴奋层和抑制层添加电压监视器
 exc_voltage_monitor = Monitor(network.layers["Ae"], ["v"], time=time, device=device)
-inh_voltage_monitor = Monitor(network.layers["Ai"], ["v"], time=time, device=device)
 network.add_monitor(exc_voltage_monitor, name="exc_voltage")
-network.add_monitor(inh_voltage_monitor, name="inh_voltage")
 
 # Load MNIST data.
 dataset = MNIST(
@@ -206,10 +232,12 @@ accuracy = {"all": [], "proportion": []}
 # Labels to determine neuron assignments and spike proportions and estimate accuracy
 labels = torch.empty(update_interval, device=device)
 
-spikes = {}
-for layer in set(network.layers):
-    spikes[layer] = Monitor(network.layers[layer], state_vars=["s"], time=time)
-    network.add_monitor(spikes[layer], name="%s_spikes" % layer)
+spikes = {
+    "X": Monitor(network.layers["X"], ["s"], time=time),
+    "Ae": Monitor(network.layers["Ae"], ["s"], time=time)
+}
+for layer in spikes:
+    network.add_monitor(spikes[layer], name=layer)
 
 # Train the network.
 print("Begin training.\n")
@@ -277,7 +305,6 @@ for i, datum in enumerate(dataloader):
 
     # Get voltage recording.
     exc_voltages = exc_voltage_monitor.get("v")
-    inh_voltages = inh_voltage_monitor.get("v")
 
     # Add to spikes recording.
     spike_record[i % update_interval] = spikes["Ae"].get("s").view(time, n_neurons)
@@ -323,7 +350,6 @@ for i, datum in enumerate(dataloader):
             input_exc_weights.view(784, n_neurons), n_sqrt, 28
         )
         square_assignments = get_square_assignments(assignments, n_sqrt)
-        voltages = {"Ae": exc_voltages, "Ai": inh_voltages}
 
         inpt_axes, inpt_ims = plot_input(
             image.sum(1).view(28, 28), inpt, label=label, axes=inpt_axes, ims=inpt_ims
@@ -333,8 +359,6 @@ for i, datum in enumerate(dataloader):
             ims=spike_ims,
             axes=spike_axes,
         )
-
-        # 修改后的绘图代码
         if conn.synapse_type == 'apical':
             plt.figure(figsize=(8,6))
             
