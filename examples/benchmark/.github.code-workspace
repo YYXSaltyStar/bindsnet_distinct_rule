@@ -1,0 +1,28 @@
+{
+	"folders": [
+		{
+			"path": "../../.github"
+		},
+		{
+			"path": "../../.pytest_cache"
+		},
+		{
+			"path": "../../.vscode"
+		},
+		{
+			"path": "../../bindsnet"
+		},
+		{
+			"path": "../../docs"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../logs"
+		},
+		{
+			"path": "../../test"
+		}
+	]
+}
