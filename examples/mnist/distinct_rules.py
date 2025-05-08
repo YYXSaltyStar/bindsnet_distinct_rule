@@ -46,14 +46,17 @@ np.random.seed(args.seed)
 torch.set_num_threads(os.cpu_count() - 1)
 
 # 网络组件
-class SpatialLearningRule:
-    def __init__(self, connection, nu, input_shape=(28,28), threshold=0.2):
-        self.connection = connection
-        self.nu = nu
-        self.input_shape = input_shape
-        self.threshold = threshold
+from bindsnet.learning import LearningRule
+
+class SpatialLearningRule(LearningRule):
+    def __init__(self, connection, nu, **kwargs):
+        super().__init__(connection=connection, nu=nu)
         
-        # 固定卷积核
+        # 从kwargs获取额外参数
+        self.input_shape = kwargs.get('input_shape', (28,28))
+        self.threshold = kwargs.get('threshold', 0.2)
+        
+        # 初始化卷积核
         self.conv = torch.nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
         self.conv.weight.data = torch.tensor(
             [[[[0.8,1.0,0.8],
@@ -63,7 +66,7 @@ class SpatialLearningRule:
         )
         self.conv.requires_grad_(False)
 
-    def update(self):
+    def update(self, **kwargs):  # 添加**kwargs接收所有参数
         pre_spike = self.connection.source.s.float().mean(dim=(0,1))
         post_act = self.connection.target.s.float().sum(dim=(0,1))
         
@@ -95,21 +98,52 @@ ae_layer = LIFNodes(
     rest=-65.0,
     tc_decay=100.0,
     refrac=5,
-    theta_plus=args.theta_plus
+    theta_plus=args.theta_plus,
+    traces=True,  # 新增参数
+    tc_trace=20.0  # 新增参数
 )
 network.add_layer(ae_layer, name="Ae")
 
-# 前馈连接
-feedforward_conn = Connection(
-    source=input_layer,
-    target=ae_layer,
-    w=0.05 + 0.1 * torch.randn(784, args.n_neurons),
-    wmin=0.0,
-    wmax=100.0,
-    update_rule=SpatialLearningRule,
-    nu=(5e-4, 0)
+#中间层
+between_layer = LIFNodes(
+    n=args.n_neurons,  # 保持与兴奋层相同规模
+    thresh=-52.0,
+    rest=-65.0,
+    tc_decay=100.0,
+    refrac=5,
+    theta_plus=args.theta_plus,
+    name="Between",
+    traces=True,  # 新增参数
+    tc_trace=20.0  # 新增参数
 )
-network.add_connection(feedforward_conn, "X", "Ae")
+network.add_layer(between_layer, name="Between")
+
+input_to_between = Connection(
+    source=input_layer,
+    target=between_layer,
+    w=0.03 + 0.05 * torch.randn(784, args.n_neurons),
+    wmin=0.0,
+    wmax=50.0,
+    update_rule=SpatialLearningRule,
+    nu=(3e-4, 0),
+    input_shape=(28,28),
+    threshold=0.15
+)
+network.add_connection(input_to_between, "X", "Between")
+
+# 中间层 -> 兴奋层（使用STDP规则）
+between_to_ae = Connection(
+    source=between_layer,
+    target=ae_layer,
+    w=0.1 * torch.randn(args.n_neurons, args.n_neurons),
+    wmin=-1.0,
+    wmax=1.0,
+    update_rule=PostPre,  # 使用内置的STDP规则
+    nu=(1e-3, 1e-3),
+    weight_decay=0.0,  # 新增必要参数
+    reduction=torch.sum  # 新增必要参数
+)
+network.add_connection(between_to_ae, "Between", "Ae")
 
 # 数据集
 transform = transforms.Compose([
@@ -125,11 +159,23 @@ dataset = MNIST(
     transform=transform
 )
 
+# 在初始化网络后，添加以下代码
+ae_spikes_monitor = Monitor(
+    obj=ae_layer,
+    state_vars=["s"],  # 监控脉冲状态's'
+    time=int(args.time / args.dt),
+)
+network.add_monitor(ae_spikes_monitor, name="Ae_spikes")
+
 # 训练准备
 spike_record = torch.zeros((args.update_interval, int(args.time/args.dt), args.n_neurons))
 assignments = -torch.ones(args.n_neurons)
 proportions = torch.zeros((args.n_neurons, 10))
 accuracy = {"all": [], "proportion": []}
+
+all_labels = []
+all_preds_all = []
+all_preds_prop = []
 
 # 训练循环
 print("\nBegin training")
@@ -150,35 +196,56 @@ for epoch in range(args.n_epochs):
         # 网络运行
         network.run(inputs=inputs, time=args.time)
         
-        # 记录数据
-        spike_record[step % args.update_interval] = network.monitors["Ae_spikes"].get("s").squeeze()
-        labels.append(batch["label"])
+        # 获取当前样本脉冲数据
+        current_spikes = network.monitors["Ae_spikes"].get("s").squeeze()  # [time, neurons]
+        current_spikes_batch = current_spikes.unsqueeze(0)  # [1, time, neurons]
         
-        # 定期更新
+        # 计算预测结果
+        with torch.no_grad():
+            all_pred = all_activity(current_spikes_batch, assignments, 10)
+            prop_pred = proportion_weighting(current_spikes_batch, assignments, proportions, 10)
+        
+        # 记录累计数据
+        all_labels.append(batch["label"].item())
+        all_preds_all.append(all_pred.item())
+        all_preds_prop.append(prop_pred.item())
+        
+        # 定期输出累计准确度 (新增功能)
+        if (step + 1) % 500 == 0:
+            current_acc_all = (torch.tensor(all_labels) == torch.tensor(all_preds_all)).float().mean().item() * 100
+            current_acc_prop = (torch.tensor(all_labels) == torch.tensor(all_preds_prop)).float().mean().item() * 100
+            print(f"\nStep {step+1} | Cumulative Acc: All {current_acc_all:.1f}% | Prop {current_acc_prop:.1f}%")
+        
+        # 原有更新逻辑保持不变
         if step > 0 and step % args.update_interval == 0:
-            label_tensor = torch.tensor(labels)
+            valid_steps = min(args.update_interval, len(labels))
+            valid_spikes = spike_record[:valid_steps]
+            valid_labels = torch.tensor(labels[:valid_steps])
             
-            # 计算准确率
-            all_pred = all_activity(spike_record, assignments, 10)
-            prop_pred = proportion_weighting(spike_record, assignments, proportions, 10)
+            interval_all_pred = all_activity(valid_spikes, assignments, 10)
+            interval_prop_pred = proportion_weighting(valid_spikes, assignments, proportions, 10)
             
-            accuracy["all"].append(100 * (label_tensor == all_pred).float().mean().item())
-            accuracy["proportion"].append(100 * (label_tensor == prop_pred).float().mean().item())
+            accuracy["all"].append(100 * (valid_labels == interval_all_pred).float().mean().item())
+            accuracy["proportion"].append(100 * (valid_labels == interval_prop_pred).float().mean().item())
             
-            # 更新标签分配
-            assignments, proportions, _ = assign_labels(spike_record, label_tensor, 10)
-            labels = []
+            assignments, proportions, _ = assign_labels(valid_spikes, valid_labels, 10)
+            labels = labels[valid_steps:]
+            spike_record = torch.roll(spike_record, shifts=-valid_steps, dims=0)
+        
+        # 记录数据
+        spike_record[step % args.update_interval] = current_spikes
+        labels.append(batch["label"].item())
         
         network.reset_state_variables()
         pbar.update(1)
     pbar.close()
-
 print("Training complete\n")
 
 # 测试流程
 test_dataset = MNIST(
     PoissonEncoder(time=args.time, dt=args.dt),
     None,
+    root=os.path.join("data", "MNIST"),
     train=False,
     transform=transform
 )
