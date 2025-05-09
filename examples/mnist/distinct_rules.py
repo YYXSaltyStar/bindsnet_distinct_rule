@@ -1,15 +1,12 @@
 import argparse
 import os
-from time import time as t
+
 import matplotlib.pyplot as plt
-from bindsnet.learning import LearningRule
 import numpy as np
 import torch
 from torchvision import transforms
 from tqdm import tqdm
-from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.network.topology import Connection
-from bindsnet.learning import PostPre
 from bindsnet.analysis.plotting import (
     plot_assignments,
     plot_input,
@@ -21,57 +18,119 @@ from bindsnet.analysis.plotting import (
 from bindsnet.datasets import MNIST
 from bindsnet.encoding import PoissonEncoder
 from bindsnet.evaluation import all_activity, assign_labels, proportion_weighting
-from bindsnet.network import Network
+from bindsnet.models import DiehlAndCook2015
 from bindsnet.network.monitors import Monitor
 from bindsnet.utils import get_square_assignments, get_square_weights
-
-# 参数配置
+#设定了以下一系列的参数命令行解释器，default代表了默认值。之后，我们可以在命令行中定义它们的值。
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--n_neurons", type=int, default=100)
-parser.add_argument("--n_epochs", type=int, default=1)
-parser.add_argument("--n_test", type=int, default=1000)
 parser.add_argument("--n_train", type=int, default=10000)
+parser.add_argument("--n_test", type=int, default=1000)
+parser.add_argument("--n_clamp", type=int, default=1)
+parser.add_argument("--exc", type=float, default=22.5)
+parser.add_argument("--inh", type=float, default=120)
 parser.add_argument("--theta_plus", type=float, default=0.05)
 parser.add_argument("--time", type=int, default=250)
 parser.add_argument("--dt", type=int, default=1.0)
-parser.add_argument("--intensity", type=float, default=48)
+parser.add_argument("--intensity", type=float, default=32)
+parser.add_argument("--progress_interval", type=int, default=10)
 parser.add_argument("--update_interval", type=int, default=250)
-parser.add_argument("--plot", action="store_true")
-args = parser.parse_args()
+parser.add_argument("--train", dest="train", action="store_true")
+parser.add_argument("--test", dest="train", action="store_false")
+parser.add_argument("--plot", dest="plot", action="store_true")
+parser.add_argument("--gpu", dest="gpu", action="store_true")
+parser.add_argument("--device_id", type=int, default=0)
+parser.set_defaults(plot=False, gpu=True, train=True)#为三个刚才定义的自变量设置默认值。
 
-# 设置随机种子
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
+args = parser.parse_args()#将之前设定的参数集合实例化
+
+seed = args.seed#随机种子
+n_neurons = args.n_neurons#神经元数量
+n_train = args.n_train#训练集数量
+n_test = args.n_test#测试集数量
+n_clamp = args.n_clamp#每个样本强制激活的神经元的数量
+exc = args.exc#兴奋性链接的初始强度
+inh = args.inh#抑制性连接的初始强度
+theta_plus = args.theta_plus#神经元发放脉冲后阈值的增量。
+time = args.time#单次输入模拟的时间步长
+dt = args.dt#单个时间步的持续时间（单位：毫秒）
+intensity = args.intensity#调整泊松编码的脉冲频率，值越大，像素高亮度区域脉冲越密集。
+progress_interval = args.progress_interval#进度条更新间隔
+update_interval = args.update_interval
+train = args.train#train和test共享一个布尔变量，train时为true，test时为false
+plot = args.plot
+gpu = args.gpu
+device_id = args.device_id
+
+# Sets up Gpu use
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if gpu and torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+else:
+    torch.manual_seed(seed)
+    device = "cpu"
+    if gpu:
+        gpu = False
+
 torch.set_num_threads(os.cpu_count() - 1)
+print("Running on Device = ", device)
 
-# 网络组件
+if not train:
+    update_interval = n_test
+
+n_classes = 10
+n_sqrt = int(np.ceil(np.sqrt(n_neurons)))
+start_intensity = intensity
+per_class = int(n_neurons / n_classes)
+
+# Build Diehl & Cook 2015 network.
+network = DiehlAndCook2015(
+    n_inpt=784,
+    n_neurons=n_neurons,
+    exc=exc,
+    inh=inh,
+    dt=dt,
+    nu=[1e-10, 1e-3],
+    norm=78.4,
+    theta_plus=theta_plus,
+    inpt_shape=(1, 28, 28),
+)
+
+input_layer = network.layers["X"]
+ae_layer = network.layers["Ae"]
+ai_layer = network.layers["Ai"]
+
 from bindsnet.learning import LearningRule
 
 class SpatialLearningRule(LearningRule):
     def __init__(self, connection, nu, **kwargs):
         super().__init__(connection=connection, nu=nu)
         
+        # 获取设备信息
+        self.device = connection.source.s.device
+        
         # 从kwargs获取额外参数
         self.input_shape = kwargs.get('input_shape', (28,28))
         self.threshold = kwargs.get('threshold', 0.2)
         
-        # 初始化卷积核
-        self.conv = torch.nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
+        # 初始化卷积核（直接创建在目标设备上）
+        self.conv = torch.nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False).to(self.device)
         self.conv.weight.data = torch.tensor(
             [[[[0.8,1.0,0.8],
                [1.0,0.0,1.0],
                [0.8,1.0,0.8]]]],
-            dtype=torch.float32
+            dtype=torch.float32, device=self.device  # 指定设备
         )
         self.conv.requires_grad_(False)
 
-    def update(self, **kwargs):  # 添加**kwargs接收所有参数
-        pre_spike = self.connection.source.s.float().mean(dim=(0,1))
-        post_act = self.connection.target.s.float().sum(dim=(0,1))
+    def update(self, **kwargs):
+        # 确保所有计算在相同设备
+        pre_spike = self.connection.source.s.float().mean(dim=(0,1)).to(self.device)
+        post_act = self.connection.target.s.float().sum(dim=(0,1)).to(self.device)
         
         try:
-            spike_2d = pre_spike.view(*self.input_shape).unsqueeze(0).unsqueeze(0)
+            spike_2d = pre_spike.view(*self.input_shape).unsqueeze(0).unsqueeze(0).to(self.device)
             neighbor_act = self.conv(spike_2d).squeeze()
         except Exception as e:
             print(f"Shape error: {pre_spike.shape} -> {self.input_shape}")
@@ -81,202 +140,241 @@ class SpatialLearningRule(LearningRule):
         post_mask = (post_act > self.threshold).float()
         
         delta_w = self.nu[0] * spatial_boost.flatten().unsqueeze(1) * post_mask.unsqueeze(0)
-        self.connection.w += delta_w
+        self.connection.w += delta_w.to(self.connection.w.device)  # 确保权重更新在正确设备
         self.connection.w.clamp_(min=0.0, max=100.0)
 
-# 初始化网络
-network = Network()
-
-# 输入层
-input_layer = Input(n=784, shape=(1,28,28), traces=True, tc_trace=20.0)
-network.add_layer(input_layer, name="X")
-
-# 神经元层
-ae_layer = LIFNodes(
-    n=args.n_neurons,
-    thresh=-52.0,
-    rest=-65.0,
-    tc_decay=100.0,
-    refrac=5,
-    theta_plus=args.theta_plus,
-    traces=True,  # 新增参数
-    tc_trace=20.0  # 新增参数
-)
-network.add_layer(ae_layer, name="Ae")
-
-#中间层
-between_layer = LIFNodes(
-    n=args.n_neurons,  # 保持与兴奋层相同规模
-    thresh=-52.0,
-    rest=-65.0,
-    tc_decay=100.0,
-    refrac=5,
-    theta_plus=args.theta_plus,
-    name="Between",
-    traces=True,  # 新增参数
-    tc_trace=20.0  # 新增参数
-)
-network.add_layer(between_layer, name="Between")
-
-input_to_between = Connection(
+# 添加Input到Ai的连接（使用自定义学习规则）
+input_to_ai_conn = Connection(
     source=input_layer,
-    target=between_layer,
-    w=0.03 + 0.05 * torch.randn(784, args.n_neurons),
-    wmin=0.0,
+    target=ai_layer,
+    w=0.03 + 0.05 * torch.randn(784, args.n_neurons),  # 权重初始化
+    wmin=-50.0,  # 允许负权重
     wmax=50.0,
     update_rule=SpatialLearningRule,
-    nu=(3e-4, 0),
-    input_shape=(28,28),
-    threshold=0.15
+    nu=(3e-4, 0),  # 学习率设置
+    input_shape=(28, 28),  # 输入形状
+    threshold=0.15  # 激活阈值
 )
-network.add_connection(input_to_between, "X", "Between")
 
-# 中间层 -> 兴奋层（使用STDP规则）
-between_to_ae = Connection(
-    source=between_layer,
-    target=ae_layer,
-    w=0.1 * torch.randn(args.n_neurons, args.n_neurons),
-    wmin=-1.0,
-    wmax=1.0,
-    update_rule=PostPre,  # 使用内置的STDP规则
-    nu=(1e-3, 1e-3),
-    weight_decay=0.0,  # 新增必要参数
-    reduction=torch.sum  # 新增必要参数
-)
-network.add_connection(between_to_ae, "Between", "Ae")
+# 将连接加入网络
+network.add_connection(input_to_ai_conn, "X", "Ai")
 
-# 数据集
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Lambda(lambda x: x * args.intensity)
-])
+# Directs network to GPU
+if gpu:
+    network.to("cuda")
 
+# Voltage recording for excitatory and inhibitory layers.
+#兴奋层和抑制层添加电压监视器
+exc_voltage_monitor = Monitor(network.layers["Ae"], ["v"], time=time, device=device)
+inh_voltage_monitor = Monitor(network.layers["Ai"], ["v"], time=time, device=device)
+network.add_monitor(exc_voltage_monitor, name="exc_voltage")
+network.add_monitor(inh_voltage_monitor, name="inh_voltage")
+
+# Load MNIST data.
 dataset = MNIST(
-    PoissonEncoder(time=args.time, dt=args.dt),
+    PoissonEncoder(time=time, dt=dt),
     None,
-    root=os.path.join("data", "MNIST"),
+    root=os.path.join("..", "..", "data", "MNIST"),
     download=True,
-    transform=transform
+    transform=transforms.Compose(
+        [transforms.ToTensor(), transforms.Lambda(lambda x: x * intensity)]
+    ),
 )
 
-# 在初始化网络后，添加以下代码
-ae_spikes_monitor = Monitor(
-    obj=ae_layer,
-    state_vars=["s"],  # 监控脉冲状态's'
-    time=int(args.time / args.dt),
-)
-network.add_monitor(ae_spikes_monitor, name="Ae_spikes")
+# Create a dataloader to iterate and batch data
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
 
-# 训练准备
-spike_record = torch.zeros((args.update_interval, int(args.time/args.dt), args.n_neurons))
-assignments = -torch.ones(args.n_neurons)
-proportions = torch.zeros((args.n_neurons, 10))
+# Record spikes during the simulation.
+spike_record = torch.zeros(update_interval, time, n_neurons, device=device)
+
+# Neuron assignments and spike proportions.
+assignments = -torch.ones_like(torch.Tensor(n_neurons), device=device)
+proportions = torch.zeros_like(torch.Tensor(n_neurons, n_classes), device=device)
+rates = torch.zeros_like(torch.Tensor(n_neurons, n_classes), device=device)
+
+# Sequence of accuracy estimates.
 accuracy = {"all": [], "proportion": []}
 
-all_labels = []
-all_preds_all = []
-all_preds_prop = []
+# Labels to determine neuron assignments and spike proportions and estimate accuracy
+labels = torch.empty(update_interval, device=device)
 
-# 训练循环
-print("\nBegin training")
-for epoch in range(args.n_epochs):
-    labels = []
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
-    
-    pbar = tqdm(total=args.n_train, desc=f"Epoch {epoch+1}")
-    for step, batch in enumerate(dataloader):
-        if step >= args.n_train:
-            break
-            
-        # 输入处理
-        inputs = {
-            "X": batch["encoded_image"].view(int(args.time/args.dt), 1, 1, 28, 28)
-        }
-        
-        # 网络运行
-        network.run(inputs=inputs, time=args.time)
-        
-        # 获取当前样本脉冲数据
-        current_spikes = network.monitors["Ae_spikes"].get("s").squeeze()  # [time, neurons]
-        current_spikes_batch = current_spikes.unsqueeze(0)  # [1, time, neurons]
-        
-        # 计算预测结果
-        with torch.no_grad():
-            all_pred = all_activity(current_spikes_batch, assignments, 10)
-            prop_pred = proportion_weighting(current_spikes_batch, assignments, proportions, 10)
-        
-        # 记录累计数据
-        all_labels.append(batch["label"].item())
-        all_preds_all.append(all_pred.item())
-        all_preds_prop.append(prop_pred.item())
-        
-        # 定期输出累计准确度 (新增功能)
-        if (step + 1) % 500 == 0:
-            current_acc_all = (torch.tensor(all_labels) == torch.tensor(all_preds_all)).float().mean().item() * 100
-            current_acc_prop = (torch.tensor(all_labels) == torch.tensor(all_preds_prop)).float().mean().item() * 100
-            print(f"\nStep {step+1} | Cumulative Acc: All {current_acc_all:.1f}% | Prop {current_acc_prop:.1f}%")
-        
-        # 原有更新逻辑保持不变
-        if step > 0 and step % args.update_interval == 0:
-            valid_steps = min(args.update_interval, len(labels))
-            valid_spikes = spike_record[:valid_steps]
-            valid_labels = torch.tensor(labels[:valid_steps])
-            
-            interval_all_pred = all_activity(valid_spikes, assignments, 10)
-            interval_prop_pred = proportion_weighting(valid_spikes, assignments, proportions, 10)
-            
-            accuracy["all"].append(100 * (valid_labels == interval_all_pred).float().mean().item())
-            accuracy["proportion"].append(100 * (valid_labels == interval_prop_pred).float().mean().item())
-            
-            assignments, proportions, _ = assign_labels(valid_spikes, valid_labels, 10)
-            labels = labels[valid_steps:]
-            spike_record = torch.roll(spike_record, shifts=-valid_steps, dims=0)
-        
-        # 记录数据
-        spike_record[step % args.update_interval] = current_spikes
-        labels.append(batch["label"].item())
-        
-        network.reset_state_variables()
-        pbar.update(1)
-    pbar.close()
-print("Training complete\n")
+spikes = {}
+for layer in set(network.layers):
+    spikes[layer] = Monitor(network.layers[layer], state_vars=["s"], time=time)
+    network.add_monitor(spikes[layer], name="%s_spikes" % layer)
 
-# 测试流程
+# Train the network.
+print("Begin training.\n")
+
+inpt_axes = None
+inpt_ims = None
+spike_axes = None
+spike_ims = None
+weights_im = None
+assigns_im = None
+perf_ax = None
+voltage_axes = None
+voltage_ims = None
+
+pbar = tqdm(total=n_train)
+for i, datum in enumerate(dataloader):
+    if i > n_train:
+        break
+
+    image = datum["encoded_image"]
+    label = datum["label"]
+
+    if i % update_interval == 0 and i > 0:
+        # Get network predictions.
+        all_activity_pred = all_activity(spike_record, assignments, n_classes)
+        proportion_pred = proportion_weighting(spike_record, assignments, proportions, n_classes)
+
+        # Compute network accuracy according to available classification strategies.
+        accuracy["all"].append(
+            100 * torch.sum(labels.long() == all_activity_pred).item() / update_interval
+        )
+        accuracy["proportion"].append(
+            100 * torch.sum(labels.long() == proportion_pred).item() / update_interval
+        )
+
+        print(
+            "\nAll activity accuracy: %.2f (last), %.2f (average), %.2f (best)"
+            % (accuracy["all"][-1], np.mean(accuracy["all"]), np.max(accuracy["all"]))
+        )
+        print(
+            "Proportion weighting accuracy: %.2f (last), %.2f (average), %.2f (best)\n"
+            % (
+                accuracy["proportion"][-1],
+                np.mean(accuracy["proportion"]),
+                np.max(accuracy["proportion"]),
+            )
+        )
+
+        # Assign labels to excitatory layer neurons.
+        assignments, proportions, rates = assign_labels(
+            spike_record, labels, n_classes, rates
+        )
+
+    # Add the current label to the list of labels for this update_interval
+    labels[i % update_interval] = label[0]
+
+    # Run the network on the input.
+    choice = np.random.choice(int(n_neurons / n_classes), size=n_clamp, replace=False)
+    clamp = {"Ae": per_class * label.long() + torch.Tensor(choice).long()}
+    if gpu:
+        inputs = {"X": image.cuda().view(time, 1, 1, 28, 28)}
+    else:
+        inputs = {"X": image.view(time, 1, 1, 28, 28)}
+    network.run(inputs=inputs, time=time, clamp=clamp)
+
+    # Get voltage recording.
+    exc_voltages = exc_voltage_monitor.get("v")
+    inh_voltages = inh_voltage_monitor.get("v")
+
+    # Add to spikes recording.
+    spike_record[i % update_interval] = spikes["Ae"].get("s").view(time, n_neurons)
+
+    # Optionally plot various simulation information.
+    if plot:
+        inpt = inputs["X"].view(time, 784).sum(0).view(28, 28)
+        input_exc_weights = network.connections[("X", "Ae")].w
+        square_weights = get_square_weights(
+            input_exc_weights.view(784, n_neurons), n_sqrt, 28
+        )
+        square_assignments = get_square_assignments(assignments, n_sqrt)
+        voltages = {"Ae": exc_voltages, "Ai": inh_voltages}
+
+        inpt_axes, inpt_ims = plot_input(
+            image.sum(1).view(28, 28), inpt, label=label, axes=inpt_axes, ims=inpt_ims
+        )
+        spike_ims, spike_axes = plot_spikes(
+            {layer: spikes[layer].get("s").view(time, 1, -1) for layer in spikes},
+            ims=spike_ims,
+            axes=spike_axes,
+        )
+        weights_im = plot_weights(square_weights, im=weights_im)
+        assigns_im = plot_assignments(square_assignments, im=assigns_im)
+        perf_ax = plot_performance(accuracy, x_scale=update_interval, ax=perf_ax)
+        voltage_ims, voltage_axes = plot_voltages(
+            voltages, ims=voltage_ims, axes=voltage_axes
+        )
+
+        plt.pause(1e-8)
+
+    network.reset_state_variables()  # Reset state variables.
+    pbar.set_description_str("Train progress: ")
+    pbar.update()
+
+print("Progress: %d / %d \n" % (n_train, n_train))
+print("Training complete.\n")
+
+print("Testing....\n")
+
+# Load MNIST data.
 test_dataset = MNIST(
-    PoissonEncoder(time=args.time, dt=args.dt),
+    PoissonEncoder(time=time, dt=dt),
     None,
-    root=os.path.join("data", "MNIST"),
+    root=os.path.join("..", "..", "data", "MNIST"),
+    download=True,
     train=False,
-    transform=transform
+    transform=transforms.Compose(
+        [transforms.ToTensor(), transforms.Lambda(lambda x: x * intensity)]
+    ),
 )
 
-correct_all = 0
-correct_prop = 0
-print("\nBegin testing")
-with torch.no_grad():
-    pbar = tqdm(total=args.n_test)
-    for i, batch in enumerate(test_dataset):
-        if i >= args.n_test:
-            break
-            
-        inputs = {"X": batch["encoded_image"].view(int(args.time/args.dt), 1, 1, 28, 28)}
-        network.run(inputs=inputs, time=args.time)
-        
-        # 获取预测结果
-        spikes = network.monitors["Ae_spikes"].get("s").squeeze().unsqueeze(0)
-        label = batch["label"]
-        
-        all_pred = all_activity(spikes, assignments, 10)
-        prop_pred = proportion_weighting(spikes, assignments, proportions, 10)
-        
-        correct_all += int(all_pred.item() == label)
-        correct_prop += int(prop_pred.item() == label)
-        
-        network.reset_state_variables()
-        pbar.update(1)
-    pbar.close()
+# Sequence of accuracy estimates.
+accuracy = {"all": 0, "proportion": 0}
 
-print(f"\nFinal Accuracy:")
-print(f"All activity: {100 * correct_all / args.n_test:.2f}%")
-print(f"Proportion weighting: {100 * correct_prop / args.n_test:.2f}%")
-print("Testing complete")
+# Record spikes during the simulation.
+spike_record = torch.zeros(1, int(time / dt), n_neurons, device=device)
+
+# Train the network.
+print("\nBegin testing\n")
+network.train(mode=False)
+
+pbar = tqdm(total=n_test)
+for step, batch in enumerate(test_dataset):
+    if step > n_test:
+        break
+    # Get next input sample.
+    inputs = {"X": batch["encoded_image"].view(int(time / dt), 1, 1, 28, 28)}
+    if gpu:
+        inputs = {k: v.cuda() for k, v in inputs.items()}
+
+    # Run the network on the input.
+    network.run(inputs=inputs, time=time)
+
+    # Add to spikes recording.
+    spike_record[0] = spikes["Ae"].get("s").squeeze()
+
+    # Convert the array of labels into a tensor
+    label_tensor = torch.tensor(batch["label"], device=device)
+
+    # Get network predictions.
+    all_activity_pred = all_activity(
+        spikes=spike_record, assignments=assignments, n_labels=n_classes
+    )
+    proportion_pred = proportion_weighting(
+        spikes=spike_record,
+        assignments=assignments,
+        proportions=proportions,
+        n_labels=n_classes,
+    )
+
+    # Compute network accuracy according to available classification strategies.
+    accuracy["all"] += float(torch.sum(label_tensor.long() == all_activity_pred).item())
+    accuracy["proportion"] += float(
+        torch.sum(label_tensor.long() == proportion_pred).item()
+    )
+
+    network.reset_state_variables()  # Reset state variables.
+
+    pbar.set_description_str(
+        f"Accuracy: {(max(accuracy['all'] ,accuracy['proportion'] ) / (step+1)):.3}"
+    )
+    pbar.update()
+
+print("\nAll activity accuracy: %.2f" % (accuracy["all"] / n_test))
+print("Proportion weighting accuracy: %.2f \n" % (accuracy["proportion"] / n_test))
+
+print("Testing complete.\n")

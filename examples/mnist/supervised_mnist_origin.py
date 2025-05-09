@@ -25,15 +25,15 @@ from bindsnet.utils import get_square_assignments, get_square_weights
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--n_neurons", type=int, default=100)
-parser.add_argument("--n_train", type=int, default=10000)
-parser.add_argument("--n_test", type=int, default=1000)
-parser.add_argument("--n_clamp", type=int, default=3)
+parser.add_argument("--n_train", type=int, default=60000)
+parser.add_argument("--n_test", type=int, default=10000)
+parser.add_argument("--n_clamp", type=int, default=1)
 parser.add_argument("--exc", type=float, default=22.5)
 parser.add_argument("--inh", type=float, default=120)
 parser.add_argument("--theta_plus", type=float, default=0.05)
 parser.add_argument("--time", type=int, default=250)
 parser.add_argument("--dt", type=int, default=1.0)
-parser.add_argument("--intensity", type=float, default=48)
+parser.add_argument("--intensity", type=float, default=32)
 parser.add_argument("--progress_interval", type=int, default=10)
 parser.add_argument("--update_interval", type=int, default=250)
 parser.add_argument("--train", dest="train", action="store_true")
@@ -41,7 +41,7 @@ parser.add_argument("--test", dest="train", action="store_false")
 parser.add_argument("--plot", dest="plot", action="store_true")
 parser.add_argument("--gpu", dest="gpu", action="store_true")
 parser.add_argument("--device_id", type=int, default=0)
-parser.set_defaults(plot=True, gpu=True, train=True)#为三个刚才定义的自变量设置默认值。
+parser.set_defaults(plot=False, gpu=True, train=True)#为三个刚才定义的自变量设置默认值。
 
 args = parser.parse_args()#将之前设定的参数集合实例化
 
@@ -233,9 +233,9 @@ for i, datum in enumerate(dataloader):
         weights_im = plot_weights(square_weights, im=weights_im)
         assigns_im = plot_assignments(square_assignments, im=assigns_im)
         perf_ax = plot_performance(accuracy, x_scale=update_interval, ax=perf_ax)
-        #voltage_ims, voltage_axes = plot_voltages(
-         #   voltages, ims=voltage_ims, axes=voltage_axes
-        #)
+        voltage_ims, voltage_axes = plot_voltages(
+            voltages, ims=voltage_ims, axes=voltage_axes
+        )
 
         plt.pause(1e-8)
 
