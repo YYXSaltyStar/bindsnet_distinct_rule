@@ -1,6 +1,5 @@
 import argparse
 import os
-
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -25,8 +24,8 @@ from bindsnet.utils import get_square_assignments, get_square_weights
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--n_neurons", type=int, default=100)
-parser.add_argument("--n_train", type=int, default=10000)
-parser.add_argument("--n_test", type=int, default=1000)
+parser.add_argument("--n_train", type=int, default=60000)
+parser.add_argument("--n_test", type=int, default=10000)
 parser.add_argument("--n_clamp", type=int, default=1)
 parser.add_argument("--exc", type=float, default=22.5)
 parser.add_argument("--inh", type=float, default=120)
