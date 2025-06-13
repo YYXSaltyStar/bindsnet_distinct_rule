@@ -15,7 +15,7 @@ from bindsnet.analysis.plotting import (
     plot_voltages,
     plot_weights,
 )
-from bindsnet.datasets import MNIST
+from bindsnet.datasets import FashionMNIST
 from bindsnet.encoding import PoissonEncoder
 from bindsnet.evaluation import all_activity, assign_labels, proportion_weighting
 from bindsnet.models import DiehlAndCook2015
@@ -106,10 +106,10 @@ def main():
     network.add_monitor(exc_voltage_monitor, name="exc_voltage")
     network.add_monitor(inh_voltage_monitor, name="inh_voltage")
 
-    dataset = MNIST(
+    dataset = FashionMNIST(
         PoissonEncoder(time=time, dt=dt),
         None,
-        root=os.path.join("..", "..", "data", "MNIST"),
+        root=os.path.join("..", "..", "data", "FashionMNIST"),
         download=True,
         transform=transforms.Compose(
             [transforms.ToTensor(), transforms.Lambda(lambda x: x * intensity)]
@@ -210,10 +210,10 @@ def main():
 
     # 测试代码
     print("Testing...\n")
-    test_dataset = MNIST(
+    test_dataset = FashionMNIST(
         PoissonEncoder(time=time, dt=dt),
         None,
-        root=os.path.join("..", "..", "data", "MNIST"),
+        root=os.path.join("..", "..", "data", "FashionMNIST"),
         download=True,
         train=False,
         transform=transforms.Compose(
