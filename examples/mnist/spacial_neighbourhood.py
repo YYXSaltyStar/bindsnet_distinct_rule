@@ -6,21 +6,14 @@ import torch
 from torchvision import transforms
 from tqdm import tqdm
 from bindsnet.network.topology import Connection
-from bindsnet.analysis.plotting import (
-    plot_assignments,
-    plot_input,
-    plot_performance,
-    plot_spikes,
-    plot_voltages,
-    plot_weights,
-)
+from bindsnet.analysis.plotting import plot_weights
 from bindsnet.datasets import FashionMNIST
 from bindsnet.encoding import PoissonEncoder
 from bindsnet.evaluation import all_activity, assign_labels, proportion_weighting
 from bindsnet.network import Network
 from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.network.monitors import Monitor
-from bindsnet.utils import get_square_assignments, get_square_weights
+from bindsnet.utils import get_square_weights
 from bindsnet.learning import LearningRule
 
 class SpatialLearningRule(LearningRule):
@@ -306,19 +299,23 @@ for layer in set(network.layers) - {"X"}:  # 不监视输入层的电压
     voltages[layer] = Monitor(network.layers[layer], state_vars=["v"], time=time, device=device)
     network.add_monitor(voltages[layer], name="%s_voltages" % layer)
 
+# 添加权重监视器 - 特别监视输入层到兴奋层的连接权重
+weight_monitor = Monitor(
+    network.connections[("X", "E")],
+    state_vars=["w"],
+    time=time,
+    device=device
+)
+network.add_monitor(weight_monitor, name="XE_weights")
+
 # 训练网络
 print("开始训练...\n")
 
-# 初始化绘图变量
-inpt_axes = None
-inpt_ims = None
-spike_axes = None
-spike_ims = None
+# 初始化权重绘图变量
+weights_fig = None
 weights_im = None
-assigns_im = None
-perf_ax = None
-voltage_axes = None
-voltage_ims = None
+weights_history = []  # 存储每个时间步的权重
+sample_interval = 100  # 每100个样本记录一次权重，避免存储过多数据
 
 # 计算实际的训练步数
 n_steps = (n_train + batch_size - 1) // batch_size
@@ -354,35 +351,36 @@ for i, datum in enumerate(dataloader):
         # 记录脉冲
         spike_record[current_samples % update_interval] = spikes["E"].get("s").view(time, n_neurons)
 
-        # 获取电压记录
-        exc_voltages = voltages["E"].get("v")
-        inh_voltages = voltages["I"].get("v")
-
-        # 可选地绘制各种模拟信息
-        if plot:
-            inpt = inputs["X"].view(time, 784).sum(0).view(28, 28)
+        # 可视化权重
+        if plot and current_samples % sample_interval == 0:
+            # 获取当前权重
             input_exc_weights = network.connections[("X", "E")].w
+            
+            # 保存权重历史
+            weights_history.append({
+                'sample': current_samples,
+                'weights': input_exc_weights.clone().detach().cpu()
+            })
+            
+            # 绘制当前权重
             square_weights = get_square_weights(
                 input_exc_weights.view(784, n_neurons), n_sqrt, 28
             )
-            square_assignments = get_square_assignments(assignments, n_sqrt)
-            voltages_to_plot = {"E": exc_voltages, "I": inh_voltages}
-
-            inpt_axes, inpt_ims = plot_input(
-                images[b].sum(0).view(28, 28), inpt, label=labels_batch[b], axes=inpt_axes, ims=inpt_ims
-            )
-            spike_ims, spike_axes = plot_spikes(
-                {layer: spikes[layer].get("s").view(time, 1, -1) for layer in spikes},
-                ims=spike_ims,
-                axes=spike_axes,
-            )
-            weights_im = plot_weights(square_weights, im=weights_im)
-            assigns_im = plot_assignments(square_assignments, im=assigns_im)
-            perf_ax = plot_performance(accuracy, x_scale=update_interval, ax=perf_ax)
-            voltage_ims, voltage_axes = plot_voltages(
-                voltages_to_plot, ims=voltage_ims, axes=voltage_axes
-            )
-
+            
+            if weights_fig is None:
+                weights_fig, ax = plt.subplots(figsize=(12, 10))
+                weights_im = ax.imshow(square_weights, cmap="hot_r", vmin=0, vmax=1)
+                ax.set_title(f"权重可视化 - 样本 {current_samples}")
+                plt.colorbar(weights_im, ax=ax)
+            else:
+                weights_im.set_data(square_weights)
+                weights_fig.suptitle(f"权重可视化 - 样本 {current_samples}")
+                
+            # 保存当前权重图
+            weight_img_path = os.path.join("..", "..", "plots", "weights", f"weights_{current_samples}.png")
+            os.makedirs(os.path.dirname(weight_img_path), exist_ok=True)
+            weights_fig.savefig(weight_img_path)
+            
             plt.pause(1e-8)
 
         # 重置网络状态
@@ -429,6 +427,95 @@ for i, datum in enumerate(dataloader):
 print(f"\n进度: {current_samples} / {n_train} \n")
 print("训练完成.\n")
 
+# 保存权重历史动画
+if plot and len(weights_history) > 0:
+    print("正在生成权重演变动画...")
+    
+    # 创建一个更详细的权重演变图
+    weights_animation_fig, axes = plt.subplots(2, 2, figsize=(18, 16))
+    axes = axes.flatten()
+    
+    # 初始化第一帧
+    first_weights = weights_history[0]['weights']
+    first_square = get_square_weights(first_weights.view(784, n_neurons), n_sqrt, 28)
+    
+    # 全局权重图
+    weights_animation_im = axes[0].imshow(first_square, cmap="hot_r", vmin=0, vmax=1)
+    axes[0].set_title("全局权重矩阵")
+    plt.colorbar(weights_animation_im, ax=axes[0])
+    
+    # 选择几个特定的神经元进行跟踪
+    tracked_neurons = [0, int(n_neurons/4), int(n_neurons/2), int(3*n_neurons/4)]
+    neuron_weights_ims = []
+    
+    for i, neuron_idx in enumerate(tracked_neurons):
+        if i+1 < len(axes):  # 确保我们有足够的子图
+            neuron_weights = first_weights[:, neuron_idx].view(28, 28)
+            im = axes[i+1].imshow(neuron_weights, cmap="hot_r", vmin=0, vmax=1)
+            axes[i+1].set_title(f"神经元 #{neuron_idx} 的权重")
+            plt.colorbar(im, ax=axes[i+1])
+            neuron_weights_ims.append(im)
+    
+    # 创建一个图表来显示权重变化趋势
+    weight_trends = []
+    samples = [data['sample'] for data in weights_history]
+    
+    for neuron_idx in tracked_neurons:
+        trend = [data['weights'][:, neuron_idx].mean().item() for data in weights_history]
+        weight_trends.append(trend)
+    
+    def update_weights_animation(frame):
+        if frame < len(weights_history):
+            current_data = weights_history[frame]
+            current_weights = current_data['weights']
+            current_square = get_square_weights(current_weights.view(784, n_neurons), n_sqrt, 28)
+            
+            # 更新全局权重图
+            weights_animation_im.set_data(current_square)
+            axes[0].set_title(f"全局权重矩阵 - 样本 {current_data['sample']}")
+            
+            # 更新每个跟踪神经元的权重图
+            for i, neuron_idx in enumerate(tracked_neurons):
+                if i+1 < len(axes):
+                    neuron_weights = current_weights[:, neuron_idx].view(28, 28)
+                    neuron_weights_ims[i].set_data(neuron_weights)
+                    axes[i+1].set_title(f"神经元 #{neuron_idx} 的权重 - 样本 {current_data['sample']}")
+            
+        return [weights_animation_im] + neuron_weights_ims
+    
+    from matplotlib.animation import FuncAnimation
+    
+    # 创建动画
+    anim = FuncAnimation(
+        weights_animation_fig, 
+        update_weights_animation,
+        frames=len(weights_history),
+        interval=300,  # 每帧间隔时间(毫秒)
+        blit=True
+    )
+    
+    # 保存动画
+    anim_path = os.path.join("..", "..", "plots", "weights", "weights_evolution.mp4")
+    os.makedirs(os.path.dirname(anim_path), exist_ok=True)
+    anim.save(anim_path, writer='ffmpeg', fps=3)
+    print(f"权重演变动画已保存至 {anim_path}")
+    
+    # 绘制权重变化趋势图
+    trend_fig, ax = plt.subplots(figsize=(12, 8))
+    for i, neuron_idx in enumerate(tracked_neurons):
+        ax.plot(samples, weight_trends[i], label=f"神经元 #{neuron_idx}")
+    
+    ax.set_xlabel("训练样本数")
+    ax.set_ylabel("平均权重")
+    ax.set_title("跟踪神经元的权重变化趋势")
+    ax.legend()
+    ax.grid(True)
+    
+    # 保存趋势图
+    trend_path = os.path.join("..", "..", "plots", "weights", "weight_trends.png")
+    trend_fig.savefig(trend_path)
+    print(f"权重变化趋势图已保存至 {trend_path}")
+
 print("开始测试...\n")
 
 # 加载测试数据
@@ -450,16 +537,6 @@ accuracy = {"all": 0, "proportion": 0}
 
 # 记录测试脉冲
 spike_record = torch.zeros(batch_size, int(time / dt), n_neurons, device=device)
-
-# 初始化绘图变量
-inpt_axes = None
-inpt_ims = None
-spike_axes = None
-spike_ims = None
-weights_im = None
-assigns_im = None
-voltage_axes = None
-voltage_ims = None
 
 # 测试网络
 network.train(mode=False)
@@ -491,10 +568,6 @@ for step, batch in enumerate(test_dataloader):
         # 记录脉冲
         spike_record[b] = spikes["E"].get("s").squeeze()
 
-        # 获取电压记录
-        exc_voltages = voltages["E"].get("v")
-        inh_voltages = voltages["I"].get("v")
-
         # 获取网络预测
         all_activity_pred = all_activity(
             spikes=spike_record[b:b+1], assignments=assignments, n_labels=n_classes
@@ -512,30 +585,81 @@ for step, batch in enumerate(test_dataloader):
             torch.sum(labels_batch[b].long() == proportion_pred).item()
         )
 
-        # 可选地绘制各种模拟信息
-        if plot:
-            inpt = inputs["X"].view(time, 784).sum(0).view(28, 28)
+        # 可选地绘制权重
+        if plot and current_samples % 10 == 0:  # 每10个样本绘制一次
             input_exc_weights = network.connections[("X", "E")].w
-            square_weights = get_square_weights(
-                input_exc_weights.view(784, n_neurons), n_sqrt, 28
-            )
-            square_assignments = get_square_assignments(assignments, n_sqrt)
-            voltages_to_plot = {"E": exc_voltages, "I": inh_voltages}
-
-            inpt_axes, inpt_ims = plot_input(
-                images[b].sum(0).view(28, 28), inpt, label=labels_batch[b], axes=inpt_axes, ims=inpt_ims
-            )
-            spike_ims, spike_axes = plot_spikes(
-                {layer: spikes[layer].get("s").view(time, 1, -1) for layer in spikes},
-                ims=spike_ims,
-                axes=spike_axes,
-            )
-            weights_im = plot_weights(square_weights, im=weights_im)
-            assigns_im = plot_assignments(square_assignments, im=assigns_im)
-            voltage_ims, voltage_axes = plot_voltages(
-                voltages_to_plot, ims=voltage_ims, axes=voltage_axes
-            )
-
+            
+            # 获取当前输入
+            if gpu:
+                current_input = images[b].cuda().view(time, 784).sum(0).view(28, 28).cpu().numpy()
+            else:
+                current_input = images[b].view(time, 784).sum(0).view(28, 28).numpy()
+            
+            # 创建一个2x2的子图布局
+            if weights_fig is None:
+                weights_fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+                axes = axes.flatten()
+                
+                # 全局权重图
+                square_weights = get_square_weights(
+                    input_exc_weights.view(784, n_neurons), n_sqrt, 28
+                )
+                weights_im = axes[0].imshow(square_weights, cmap="hot_r", vmin=0, vmax=1)
+                axes[0].set_title(f"全局权重矩阵 - 测试样本 {current_samples}")
+                plt.colorbar(weights_im, ax=axes[0])
+                
+                # 当前输入图像
+                input_im = axes[1].imshow(current_input, cmap="gray")
+                axes[1].set_title(f"当前输入 - 标签: {labels_batch[b]}")
+                plt.colorbar(input_im, ax=axes[1])
+                
+                # 选择两个神经元进行详细可视化
+                neuron1_idx = int(n_neurons/3)
+                neuron2_idx = int(2*n_neurons/3)
+                
+                neuron1_weights = input_exc_weights[:, neuron1_idx].view(28, 28)
+                neuron1_im = axes[2].imshow(neuron1_weights, cmap="hot_r", vmin=0, vmax=1)
+                axes[2].set_title(f"神经元 #{neuron1_idx} 的权重")
+                plt.colorbar(neuron1_im, ax=axes[2])
+                
+                neuron2_weights = input_exc_weights[:, neuron2_idx].view(28, 28)
+                neuron2_im = axes[3].imshow(neuron2_weights, cmap="hot_r", vmin=0, vmax=1)
+                axes[3].set_title(f"神经元 #{neuron2_idx} 的权重")
+                plt.colorbar(neuron2_im, ax=axes[3])
+                
+                # 保存当前权重图
+                weight_img_path = os.path.join("..", "..", "plots", "weights", f"test_weights_{current_samples}.png")
+                os.makedirs(os.path.dirname(weight_img_path), exist_ok=True)
+                weights_fig.savefig(weight_img_path)
+            else:
+                axes = weights_fig.axes
+                
+                # 更新全局权重图
+                square_weights = get_square_weights(
+                    input_exc_weights.view(784, n_neurons), n_sqrt, 28
+                )
+                axes[0].images[0].set_data(square_weights)
+                axes[0].set_title(f"全局权重矩阵 - 测试样本 {current_samples}")
+                
+                # 更新当前输入图像
+                axes[1].images[0].set_data(current_input)
+                axes[1].set_title(f"当前输入 - 标签: {labels_batch[b]}")
+                
+                # 更新神经元权重图
+                neuron1_idx = int(n_neurons/3)
+                neuron2_idx = int(2*n_neurons/3)
+                
+                neuron1_weights = input_exc_weights[:, neuron1_idx].view(28, 28)
+                axes[2].images[0].set_data(neuron1_weights)
+                
+                neuron2_weights = input_exc_weights[:, neuron2_idx].view(28, 28)
+                axes[3].images[0].set_data(neuron2_weights)
+                
+                # 保存更新后的权重图
+                weight_img_path = os.path.join("..", "..", "plots", "weights", f"test_weights_{current_samples}.png")
+                os.makedirs(os.path.dirname(weight_img_path), exist_ok=True)
+                weights_fig.savefig(weight_img_path)
+            
             plt.pause(1e-8)
 
         network.reset_state_variables()
@@ -551,4 +675,8 @@ for step, batch in enumerate(test_dataloader):
 print("\nAll activity准确率: %.2f" % (accuracy["all"] / n_test))
 print("Proportion weighting准确率: %.2f \n" % (accuracy["proportion"] / n_test))
 
-print("测试完成.\n") 
+print("测试完成.\n")
+
+# 如果有绘图窗口，保持它们打开
+if plot:
+    plt.show() 
