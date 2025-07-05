@@ -256,6 +256,19 @@ class DiehlAndCook2015_with_SPL(Network):
             wmax=wmax,
             norm=norm,
         )
+
+        input_exc_conn = Connection(
+            source=input_layer,
+            target=exc_layer,
+            w=w,
+            update_rule=PostPre,
+            nu=nu,
+            reduction=reduction,
+            wmin=wmin,
+            wmax=wmax,
+            norm=norm,
+        )
+
         w = self.exc * torch.diag(torch.ones(self.n_neurons))
         exc_inh_conn = Connection(
             source=exc_layer, target=inh_layer, w=w, wmin=0, wmax=self.exc

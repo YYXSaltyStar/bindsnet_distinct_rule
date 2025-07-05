@@ -103,7 +103,7 @@ class SpatialLearningRule(LearningRule):
                     post_window = post_spikes[t:t+self.window, j]
                     
                     # STDP学习
-                    """pre_times为tensor([1]),表示脉冲发生在索引1处
+                    """pre_times为tensor([1]),表示脉冲发生在索引1处:
                     post_times为tensor([3,8]),表示脉冲发生在索引3和8处"""
                     pre_times = (pre_window > 0).nonzero(as_tuple=True)[0]
                     post_times = (post_window > 0).nonzero(as_tuple=True)[0]
@@ -116,42 +116,42 @@ class SpatialLearningRule(LearningRule):
                         
                         if len(valid_diffs) > 0:
                             # 计算权重更新量
-                            updates = self.nu[0] * torch.exp(-valid_diffs / self.tau)
+                            updates = self.nu[0] * torch.exp(-valid_diffs / self.tau)#这里有问题，原来的话，增强用的是1e-10,减弱用的1e-3
                             # 累加所有有效的更新量
                             delta_w[i, j] += updates.sum()
                     
                     # 空间邻域增强 - 保留空间映射功能
-                    pre_y, pre_x = divmod(i, self.input_shape[1])#divmod同时返回商和余数，可以直接将一维的输入层索引i转换为二维的坐标(x,y)
-                    for dy in range(-self.neighbor_radius, self.neighbor_radius+1):
-                        for dx in range(-self.neighbor_radius, self.neighbor_radius+1):
-                            ni, nj = pre_y+dy, pre_x+dx# 在输入层中的神经元
-                            if 0 <= ni < self.input_shape[0] and 0 <= nj < self.input_shape[1]:
-                                n_idx = ni * self.input_shape[1] + nj# 将二维坐标转换为一维索引，仅仅是为了能够使用for循环，并保证不超过输入层神经元数量
-                                if n_idx < N_pre:
-                                    """这里的思路有点绕。我们有了 输入层 的一个小矩阵中的一个神经元的二维索引(x,y)
-                                    我们想得到这个神经元在 输入层 中的所有邻居的二维索引，
-                                    那就先转换成 输出层 的一个神经元的二维索引，
-                                    然后通过函数get_input_coordinates，得到这个神经元在 输入层 中的所有邻居的二维索引
-                                    然后再通过函数get_region_spikes，得到这个神经元在 输入层 中的所有邻居的脉冲情况
-                                    """
-                                    neighbor_region_coords = self.get_input_coordinates(#得到了输入层的矩阵
-                                        self.convert_input_to_E(ni, nj)[0],
-                                        self.convert_input_to_E(ni, nj)[1]
-                                    )
-                                    neighbor_pre_spikes = self.get_region_spikes(
-                                        pre_spikes, neighbor_region_coords, t, self.window
-                                    )
+                    # pre_y, pre_x = divmod(i, self.input_shape[1])#divmod同时返回商和余数，可以直接将一维的输入层索引i转换为二维的坐标(x,y)
+                    # for dy in range(-self.neighbor_radius, self.neighbor_radius+1):
+                    #     for dx in range(-self.neighbor_radius, self.neighbor_radius+1):
+                    #         ni, nj = pre_y+dy, pre_x+dx# 在输入层中的神经元
+                    #         if 0 <= ni < self.input_shape[0] and 0 <= nj < self.input_shape[1]:
+                    #             n_idx = ni * self.input_shape[1] + nj# 将二维坐标转换为一维索引，仅仅是为了能够使用for循环，并保证不超过输入层神经元数量
+                    #             if n_idx < N_pre:
+                    #                 """这里的思路有点绕。我们有了 输入层 的一个小矩阵中的一个神经元的二维索引(x,y)
+                    #                 我们想得到这个神经元在 输入层 中的所有邻居的二维索引，
+                    #                 那就先转换成 输出层 的一个神经元的二维索引，
+                    #                 然后通过函数get_input_coordinates，得到这个神经元在 输入层 中的所有邻居的二维索引
+                    #                 然后再通过函数get_region_spikes，得到这个神经元在 输入层 中的所有邻居的脉冲情况
+                    #                 """
+                    #                 neighbor_region_coords = self.get_input_coordinates(#得到了输入层的矩阵
+                    #                     self.convert_input_to_E(ni, nj)[0],
+                    #                     self.convert_input_to_E(ni, nj)[1]
+                    #                 )
+                    #                 neighbor_pre_spikes = self.get_region_spikes(
+                    #                     pre_spikes, neighbor_region_coords, t, self.window
+                    #                 )
                                     
-                                    if len((neighbor_pre_spikes > 0).nonzero(as_tuple=True)[0]) > 0 and \
-                                       len(post_times) > 0:
-                                        """第一行：判断输入层上，时间窗口中，是否有神经元活动
-                                        第二行：判断输出层上，时间窗口中，是否有神经元活动
-                                        0.5/矩阵面积(为了平摊)倍率的nu(试着调参)
-                                        """
-                                        for y, x in neighbor_region_coords:
-                                            idx = y * self.input_shape[1] + x
-                                            #idx指的是在输入层，即感受野上的神经元矩阵；j表示一个输出层的神经元
-                                            delta_w[idx, j] += self.nu[0] * 0.5 / len(neighbor_region_coords)#这里除以len(neighbor_region_coords)是为了将权重按照空间平均分配到邻居神经元上
+                    #                 if len((neighbor_pre_spikes > 0).nonzero(as_tuple=True)[0]) > 0 and \
+                    #                    len(post_times) > 0:
+                    #                     """第一行：判断输入层上，时间窗口中，是否有神经元活动
+                    #                     第二行：判断输出层上，时间窗口中，是否有神经元活动
+                    #                     0.5/矩阵面积(为了平摊)倍率的nu(试着调参)
+                    #                     """
+                    #                     for y, x in neighbor_region_coords:
+                    #                         idx = y * self.input_shape[1] + x
+                    #                         #idx指的是在输入层，即感受野上的神经元矩阵；j表示一个输出层的神经元
+                    #                         delta_w[idx, j] += self.nu[0] * 0.5 / len(neighbor_region_coords)#这里除以len(neighbor_region_coords)是为了将权重按照空间平均分配到邻居神经元上
 
         # 权重更新
         w += delta_w
@@ -256,6 +256,19 @@ class DiehlAndCook2015_with_SPL(Network):
             wmax=wmax,
             norm=norm,
         )
+
+        input_exc_conn = Connection(
+            source=input_layer,
+            target=exc_layer,
+            w=w,
+            update_rule=PostPre,
+            nu=nu,
+            reduction=reduction,
+            wmin=wmin,
+            wmax=wmax,
+            norm=norm,
+        )
+
         w = self.exc * torch.diag(torch.ones(self.n_neurons))
         exc_inh_conn = Connection(
             source=exc_layer, target=inh_layer, w=w, wmin=0, wmax=self.exc
@@ -275,3 +288,5 @@ class DiehlAndCook2015_with_SPL(Network):
         self.add_connection(input_exc_conn, source="X", target="Ae")
         self.add_connection(exc_inh_conn, source="Ae", target="Ai")
         self.add_connection(inh_exc_conn, source="Ai", target="Ae")
+
+
