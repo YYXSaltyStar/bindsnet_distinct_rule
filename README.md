@@ -1,8 +1,8 @@
 # 文件说明
 ## my_SPL_tool.py
 my_SPL_tool.py用来存放写好的spacial_learning_rule类以及修改过的神经网络
+在其中有CombinedSpatialPostPre的详细注释
 ## 文件夹
 修改好的文件分别放在MNIST、cifar10、dotTracing、tensorboard文件夹中
-weight_result用来保存运行的权重热图和csv文件(每250个文件保存一次)。其实bindsnet给的画图函数画出来的热图已经够用了
 ## 数据集
 数据集没有上传，需要重新下载
