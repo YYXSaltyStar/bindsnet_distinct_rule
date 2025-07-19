@@ -10,37 +10,108 @@ from bindsnet.network.nodes import DiehlAndCookNodes, Input, LIFNodes
 from bindsnet.network.topology import Connection, LocalConnection
 from bindsnet.learning import LearningRule
 
-class SpatialLearningRule(LearningRule):
-    def __init__(self, connection, nu, **kwargs):
-        super().__init__(connection=connection, nu=nu)
-        self.device = connection.source.s.device
+from typing import Optional, Sequence, Union, Tuple
+import torch
+from torch.nn.modules.utils import _pair
+import torch.nn.functional as F
+
+from bindsnet.learning import PostPre, LearningRule
+from bindsnet.network.topology import AbstractConnection, Connection
+
+
+class CombinedSpatialPostPre(PostPre):
+    """
+    结合了标准STDP(PostPre)和空间邻域增强(SpatialLearningRule)的学习规则。
+    通过继承PostPre类获取其高效向量化的STDP实现，同时整合空间邻域增强逻辑。
+    """
+
+    def __init__(
+        self,
+        connection: AbstractConnection,
+        nu: Optional[Union[float, Sequence[float], Sequence[torch.Tensor]]] = None,
+        reduction: Optional[callable] = None,
+        weight_decay: float = 0.0,
+        **kwargs
+    ) -> None:
+        """
+        CombinedSpatialPostPre学习规则的构造函数。
+
+        :param connection: 将被此学习规则修改权重的AbstractConnection对象。
+        :param nu: 学习率。可以是：
+              - 单个浮点数：将被用作所有学习率
+              - 包含两个浮点数的列表/元组：用于STDP的前后突触更新
+              - 包含三个浮点数的列表/元组：前两个用于STDP，第三个用于空间学习
+        :param reduction: 用于在批次维度上减少参数更新的方法。
+        :param weight_decay: 控制每次迭代权重衰减率的系数。
+        :param kwargs: 空间学习所需的其他参数，如input_shape, output_shape等。
+        """
+        # 处理不同形式的nu参数
+        if nu is None:
+            self.nu_spatial = 1e-4  # 默认空间学习率
+            nu_stdp = nu
+        elif isinstance(nu, (list, tuple)) and len(nu) >= 3:
+            self.nu_spatial = float(nu[2])  # 确保是浮点数
+            nu_stdp = nu[:2]
+        elif isinstance(nu, (list, tuple)) and len(nu) == 2:
+            self.nu_spatial = 1e-4  # 默认空间学习率
+            nu_stdp = nu
+        else:
+            # 如果是单个值（浮点数或张量），将其用于所有学习率
+            self.nu_spatial = float(nu) if isinstance(nu, (int, float)) else 1e-4
+            nu_stdp = nu
+
+        # 调用父类构造函数，传递STDP相关参数
+        super().__init__(
+            connection=connection,
+            nu=nu_stdp,
+            reduction=reduction,
+            weight_decay=weight_decay,
+        )
+
+        # 存储空间学习规则所需的参数
         self.input_shape = kwargs.get('input_shape', (28, 28))
         self.output_shape = kwargs.get('output_shape', (10, 10))
-        self.threshold = kwargs.get('threshold', 0.15)
         self.window = kwargs.get('window', 10)
-        self.neighbor_radius = kwargs.get('neighbor_radius', 1)#对于3*3的区域
+        self.neighbor_radius = kwargs.get('neighbor_radius', 1)
         self.tau = kwargs.get('tau', 1.0)
+        # 确保设备正确设置
+        if hasattr(connection, 'w') and connection.w is not None:
+            self.device = connection.w.device
+        elif hasattr(connection.source, 's') and connection.source.s is not None:
+            self.device = connection.source.s.device
+        else:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def convert_input_to_E(self, pre_y, pre_x):
-        """给出输入层的一个神经元的坐标,返回输出层的一个神经元的坐标"""
-        scale_y = self.output_shape[0] / self.input_shape[0]#10/28
-        scale_x = self.output_shape[1] / self.input_shape[1]#10/28
-        post_y = int(pre_y * scale_y)#10/28*y
-        post_x = int(pre_x * scale_x)#10/28*x
+    def convert_input_to_E(self, pre_y: int, pre_x: int) -> Tuple[int, int]:
+        """
+        将输入层坐标映射到输出层坐标。
+
+        :param pre_y: 输入层的y坐标
+        :param pre_x: 输入层的x坐标
+        :return: 对应的输出层坐标 (post_y, post_x)
+        """
+        scale_y = self.output_shape[0] / self.input_shape[0]
+        scale_x = self.output_shape[1] / self.input_shape[1]
+        post_y = int(pre_y * scale_y)
+        post_x = int(pre_x * scale_x)
         return post_y, post_x
 
-    def get_input_coordinates(self, pre_y, pre_x):
-        """获取输出层上一个神经元对应的输入层区域矩阵"""
-        scale_y = self.input_shape[0] / self.output_shape[0]#28/10
-        scale_x = self.input_shape[1] / self.output_shape[1]#28/10
+    def get_input_coordinates(self, pre_y: int, pre_x: int) -> list:
+        """
+        获取输出层上一个神经元对应的输入层区域矩阵坐标。
+
+        :param pre_y: 输出层的y坐标
+        :param pre_x: 输出层的x坐标
+        :return: 输入层区域内的所有坐标列表
+        """
+        scale_y = self.input_shape[0] / self.output_shape[0]
+        scale_x = self.input_shape[1] / self.output_shape[1]
         
-        # 计算区域范围（对于输出层的一个单点）
-        start_y = int(pre_y * scale_y)#28/10*y
-        start_x = int(pre_x * scale_x)#28/10*x
-        end_y = int((pre_y + 1) * scale_y)#28/10*(y+1)
-        end_x = int((pre_x + 1) * scale_x)#28/10*(x+1)
+        start_y = int(pre_y * scale_y)
+        start_x = int(pre_x * scale_x)
+        end_y = int((pre_y + 1) * scale_y)
+        end_x = int((pre_x + 1) * scale_x)
         
-        # 生成区域内的所有坐标
         coords = []
         for y in range(start_y, end_y):
             for x in range(start_x, end_x):
@@ -48,35 +119,70 @@ class SpatialLearningRule(LearningRule):
                     coords.append((y, x))
         return coords
 
-    def get_region_spikes(self, pre_spikes, region_coords, t, window):
-        """输入之前获得的region_coords,返回区域内的脉冲活动"""
-        region_spikes = []
-        """用来填入之前input层神经元矩阵的脉冲情况
-        假设有四个神经元,时间窗口为4,则regin_spokes长这样:
-        [[1,0,0,0],
-        [0,1,0,0],
-        [1,0,1,0],
-        [0,1,0,0]]
+    def get_region_spikes(self, pre_spikes: torch.Tensor, region_coords: list, t: int, window: int) -> torch.Tensor:
         """
+        获取区域内的脉冲活动。
+
+        :param pre_spikes: 输入层的脉冲张量
+        :param region_coords: 区域坐标列表
+        :param t: 当前时间步
+        :param window: 时间窗口大小
+        :return: 区域内的最大脉冲活动
+        """
+        region_spikes = []
         for y, x in region_coords:
-            #先把二维的坐标(x,y)转换为一维的索引,这是为了配合监视器上的索引
             idx = y * self.input_shape[1] + x
-            spikes = pre_spikes[t:t+window, idx]#得到一个时间窗口上的脉冲[1,0,0,0]
+            spikes = pre_spikes[t:t+window, idx]
             region_spikes.append(spikes)
         return torch.stack(region_spikes).max(dim=0)[0]  # 取最大值
-        """最后会得到一个一维的向量,长度为4,表示这个区域在时间窗口内的脉冲情况[1,1,1,0]"""
 
-    def update(self, **kwargs):
+    def _connection_update(self, **kwargs) -> None:
+        """
+        重写Connection类型的更新方法，结合STDP和空间邻域增强。
+        
+        此方法分三步进行：
+        1. 计算PostPre(STDP)的权重更新量
+        2. 计算空间邻域增强的权重更新量
+        3. 将两种更新量相加并应用到连接权重上
+        """
+        batch_size = self.source.batch_size
+        
+        # 初始化权重更新量
+        delta_w_postpre = torch.zeros_like(self.connection.w, device=self.device)
+        
+        # 步骤A: 计算PostPre(STDP)的权重更新量
+        # 这部分代码从PostPre._connection_update方法复制而来，
+        # 但修改为累积更新量而不是直接应用到权重上
+        
+        # 前突触更新 (LTD: Long-Term Depression)
+        if self.nu[0].any():
+            source_s = self.source.s.view(batch_size, -1).unsqueeze(2).float().to(self.device)
+            target_x = (self.target.x.view(batch_size, -1).unsqueeze(1) * self.nu[0]).to(self.device)
+            delta_w_postpre -= self.reduction(torch.bmm(source_s, target_x), dim=0)
+            del source_s, target_x
+
+        # 后突触更新 (LTP: Long-Term Potentiation)
+        if self.nu[1].any():
+            target_s = (
+                self.target.s.view(batch_size, -1).unsqueeze(1).float() * self.nu[1]
+            ).to(self.device)
+            source_x = self.source.x.view(batch_size, -1).unsqueeze(2).to(self.device)
+            delta_w_postpre += self.reduction(torch.bmm(source_x, target_s), dim=0)
+            del source_x, target_s
+        
+        #步骤B: 计算空间邻域增强的权重更新量
+        delta_w_spatial = torch.zeros_like(self.connection.w, device=self.device)
+        
+        # 获取并处理脉冲数据
         pre_spikes = self.connection.source.s.float().to(self.device)
         post_spikes = self.connection.target.s.float().to(self.device)
         
-        # 重塑张量维度
-        if len(pre_spikes.shape) == 4:  # 例如, 输入层脉冲可能是 [batch_size, channels, height, width] -> [1, 1, 28, 28]
-            pre_spikes = pre_spikes.view(pre_spikes.shape[0], pre_spikes.shape[1], -1)  # 重塑为 [1, 1, 28*28]
+        # 维度处理
+        if len(pre_spikes.shape) == 4:  # 例如 [batch_size, channels, height, width]
+            pre_spikes = pre_spikes.view(pre_spikes.shape[0], pre_spikes.shape[1], -1)
         if len(post_spikes.shape) == 4:
             post_spikes = post_spikes.view(1, 1, -1)
         
-        # 检查并调整维度
         if len(pre_spikes.shape) == 2:  # 如果只有两个维度 (T, N)
             pre_spikes = pre_spikes.unsqueeze(1)  # 添加批次维度 (T, 1, N)
         if len(post_spikes.shape) == 2:
@@ -84,79 +190,42 @@ class SpatialLearningRule(LearningRule):
         
         T, B, N_pre = pre_spikes.shape
         _, _, N_post = post_spikes.shape
-        pre_spikes = pre_spikes[:, 0, :]# pre_spikes从[250, 1, 784]变为[250, 784]
-        post_spikes = post_spikes[:, 0, :]# post_spikes从[250, 1, 100]变为[250,1, 100]
-
-        # 确保所有权重相关张量在正确的设备上
-        w = self.connection.w.data.to(self.device)
-        wmin = torch.tensor(self.connection.wmin, device=self.device)
-        wmax = torch.tensor(self.connection.wmax, device=self.device)
-        delta_w = torch.zeros_like(w, device=self.device)
+        pre_spikes = pre_spikes[:, 0, :]  # 从[T, B, N]变为[T, N]
+        post_spikes = post_spikes[:, 0, :]
         
-        # 遍历所有时间步,逐时间处理STDP和空间邻域增强
+        # 实现空间邻域增强逻辑
         for t in range(T - self.window):  # 确保有足够的窗口大小
-            # 遍历所有连接
-            for i in range(N_pre):#784次循环
-                for j in range(N_post):#100次循环
-                    # 获取时间窗口内的脉冲
-                    pre_window = pre_spikes[t:t+self.window, i]#例如[0,1,0,0,0,0,0,0,0,0]表示在窗口的第2个时间步有脉冲
-                    post_window = post_spikes[t:t+self.window, j]
-                    
-                    # STDP学习
-                    """pre_times为tensor([1]),表示脉冲发生在索引1处
-                    post_times为tensor([3,8]),表示脉冲发生在索引3和8处"""
-                    pre_times = (pre_window > 0).nonzero(as_tuple=True)[0]
-                    post_times = (post_window > 0).nonzero(as_tuple=True)[0]
-                    
-                    if len(pre_times) > 0 and len(post_times) > 0:
-                        # 计算所有可能的时间差,例如上面距离的，分别为3-1和8-1
-                        time_diffs = post_times.unsqueeze(0) - pre_times.unsqueeze(1)#unsqueeze(0)和unsqueeze(1)是为了将tensor变成一个纵向向量和一个横向向量
-                        # 只保留前神经元先发放的情况
-                        valid_diffs = time_diffs[time_diffs > 0]
-                        
-                        if len(valid_diffs) > 0:
-                            # 计算权重更新量
-                            updates = self.nu[0] * torch.exp(-valid_diffs / self.tau)
-                            # 累加所有有效的更新量
-                            delta_w[i, j] += updates.sum()
-                    
-                    # 空间邻域增强 - 保留空间映射功能
-                    pre_y, pre_x = divmod(i, self.input_shape[1])#divmod同时返回商和余数，可以直接将一维的输入层索引i转换为二维的坐标(x,y)
-                    for dy in range(-self.neighbor_radius, self.neighbor_radius+1):
-                        for dx in range(-self.neighbor_radius, self.neighbor_radius+1):
-                            ni, nj = pre_y+dy, pre_x+dx# 在输入层中的神经元
-                            if 0 <= ni < self.input_shape[0] and 0 <= nj < self.input_shape[1]:
-                                n_idx = ni * self.input_shape[1] + nj# 将二维坐标转换为一维索引，仅仅是为了能够使用for循环，并保证不超过输入层神经元数量
-                                if n_idx < N_pre:
-                                    """这里的思路有点绕。我们有了 输入层 的一个小矩阵中的一个神经元的二维索引(x,y)
-                                    我们想得到这个神经元在 输入层 中的所有邻居的二维索引，
-                                    那就先转换成 输出层 的一个神经元的二维索引，
-                                    然后通过函数get_input_coordinates，得到这个神经元在 输入层 中的所有邻居的二维索引
-                                    然后再通过函数get_region_spikes，得到这个神经元在 输入层 中的所有邻居的脉冲情况
-                                    """
-                                    neighbor_region_coords = self.get_input_coordinates(#得到了输入层的矩阵
-                                        self.convert_input_to_E(ni, nj)[0],
-                                        self.convert_input_to_E(ni, nj)[1]
-                                    )
-                                    neighbor_pre_spikes = self.get_region_spikes(
-                                        pre_spikes, neighbor_region_coords, t, self.window
-                                    )
-                                    
-                                    if len((neighbor_pre_spikes > 0).nonzero(as_tuple=True)[0]) > 0 and \
-                                       len(post_times) > 0:
-                                        """第一行：判断输入层上，时间窗口中，是否有神经元活动
-                                        第二行：判断输出层上，时间窗口中，是否有神经元活动
-                                        0.5/矩阵面积(为了平摊)倍率的nu(试着调参)
-                                        """
-                                        for y, x in neighbor_region_coords:
-                                            idx = y * self.input_shape[1] + x
-                                            #idx指的是在输入层，即感受野上的神经元矩阵；j表示一个输出层的神经元
-                                            delta_w[idx, j] += self.nu[0] * 0.5 / len(neighbor_region_coords)#这里除以len(neighbor_region_coords)是为了将权重按照空间平均分配到邻居神经元上
-
-        # 权重更新
-        w += delta_w
-        w.clamp_(wmin, wmax)
-        self.connection.w.data.copy_(w)
+            for i in range(N_pre):
+                pre_y, pre_x = divmod(i, self.input_shape[1])
+                for dy in range(-self.neighbor_radius, self.neighbor_radius+1):
+                    for dx in range(-self.neighbor_radius, self.neighbor_radius+1):
+                        ni, nj = pre_y+dy, pre_x+dx
+                        if 0 <= ni < self.input_shape[0] and 0 <= nj < self.input_shape[1]:
+                            n_idx = ni * self.input_shape[1] + nj
+                            if n_idx < N_pre:
+                                neighbor_region_coords = self.get_input_coordinates(
+                                    *self.convert_input_to_E(ni, nj)
+                                )
+                                neighbor_pre_spikes = self.get_region_spikes(
+                                    pre_spikes, neighbor_region_coords, t, self.window
+                                )
+                                post_times = (post_spikes[t:t+self.window, :] > 0).nonzero(as_tuple=True)[0]
+                                if len((neighbor_pre_spikes > 0).nonzero(as_tuple=True)[0]) > 0 and len(post_times) > 0:
+                                    for j in range(N_post):
+                                        # 使用专门的空间学习率
+                                        delta_w_spatial[n_idx, j] += self.nu_spatial * 0.5 / len(neighbor_region_coords)
+        
+        #步骤C: 组合并应用更新
+        # 将两种更新量相加并应用到连接权重上
+        total_delta_w = delta_w_postpre + delta_w_spatial
+        # 确保权重和更新量在同一设备上
+        if self.connection.w.device != total_delta_w.device:
+            total_delta_w = total_delta_w.to(self.connection.w.device)
+        self.connection.w += total_delta_w
+        
+        #步骤D: 处理权重衰减
+        # 调用父类的update方法来处理权重衰减
+        LearningRule.update(self)  #
 
 
 class DiehlAndCook2015_with_SPL(Network):
@@ -249,7 +318,7 @@ class DiehlAndCook2015_with_SPL(Network):
             source=input_layer,
             target=exc_layer,
             w=w,
-            update_rule=SpatialLearningRule,
+            update_rule=CombinedSpatialPostPre,
             nu=nu,
             reduction=reduction,
             wmin=wmin,
@@ -288,3 +357,5 @@ class DiehlAndCook2015_with_SPL(Network):
         self.add_connection(input_exc_conn, source="X", target="Ae")
         self.add_connection(exc_inh_conn, source="Ae", target="Ai")
         self.add_connection(inh_exc_conn, source="Ai", target="Ae")
+
+

@@ -21,6 +21,12 @@ from bindsnet.network.monitors import Monitor
 from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.network.topology import Connection
 
+# 导入my_SPL_tool包
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from my_SPL_tool import CombinedSpatialPostPre
+
 # Handle arguments for dot tracing params.
 parser = argparse.ArgumentParser()
 parser.add_argument("--steps", type=int, default=100)
@@ -222,7 +228,7 @@ def main():
         target=middle,
         wmin=0,  # minimum weight value
         wmax=1,  # maximum weight value
-        update_rule=PostPre,  # learning rule
+        update_rule=CombinedSpatialPostPre,  # learning rule
         nu=1e-1,  # learning rate
         norm=5e-3 * middle.n,  # normalization
     )
