@@ -28,7 +28,7 @@ class CombinedSpatialPostPre(PostPre):
     def __init__(
         self,
         connection: AbstractConnection,
-        nu: Optional[Union[float, Sequence[float], Sequence[torch.Tensor]]] = None,
+        nu: Optional[Union[float, Sequence[float], Sequence[torch.Tensor]]] = None,#nu之所以变成这样，是因为之前产生了许多张量不匹配、float不匹配的问题
         reduction: Optional[callable] = None,
         weight_decay: float = 0.0,
         **kwargs
@@ -45,7 +45,7 @@ class CombinedSpatialPostPre(PostPre):
         :param weight_decay: 控制每次迭代权重衰减率的系数。
         :param kwargs: 空间学习所需的其他参数，如input_shape, output_shape等。
         """
-        # 处理不同形式的nu参数
+        # nu参数的处理过程，避免出现张量问题
         if nu is None:
             self.nu_spatial = 1e-4  # 默认空间学习率
             nu_stdp = nu
@@ -60,6 +60,7 @@ class CombinedSpatialPostPre(PostPre):
             self.nu_spatial = float(nu) if isinstance(nu, (int, float)) else 1e-4
             nu_stdp = nu
 
+
         # 调用父类构造函数，传递STDP相关参数
         super().__init__(
             connection=connection,
@@ -69,8 +70,8 @@ class CombinedSpatialPostPre(PostPre):
         )
 
         # 存储空间学习规则所需的参数
-        self.input_shape = kwargs.get('input_shape', (28, 28))
-        self.output_shape = kwargs.get('output_shape', (10, 10))
+        self.input_shape = kwargs.get('input_shape')
+        self.output_shape = kwargs.get('output_shape')
         self.window = kwargs.get('window', 10)
         self.neighbor_radius = kwargs.get('neighbor_radius', 1)
         self.tau = kwargs.get('tau', 1.0)
