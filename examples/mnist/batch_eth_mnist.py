@@ -21,8 +21,12 @@ from bindsnet.datasets import MNIST, DataLoader
 from bindsnet.encoding import PoissonEncoder
 from bindsnet.evaluation import all_activity, assign_labels, proportion_weighting
 from bindsnet.models import DiehlAndCook2015
+from bindsnet.network import Network
+from bindsnet.network.nodes import Input, LIFNodes
+from bindsnet.network.topology import Connection
 from bindsnet.network.monitors import Monitor
 from bindsnet.utils import get_square_assignments, get_square_weights
+from snn_utils import SpatialLearningRule
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
@@ -91,18 +95,60 @@ if n_workers == -1:
 n_sqrt = int(np.ceil(np.sqrt(n_neurons)))
 start_intensity = intensity
 
-# Build network.
-network = DiehlAndCook2015(
-    n_inpt=784,
-    n_neurons=n_neurons,
-    exc=exc,
-    inh=inh,
-    dt=dt,
-    norm=78.4,
-    nu=(1e-4, 1e-2),
-    theta_plus=theta_plus,
-    inpt_shape=(1, 28, 28),
+# 创建网络对象
+torch.manual_seed(seed)
+network = Network(dt=dt)
+
+# 输入层（784个神经元，适配28x28图像）
+input_layer = Input(n=784, shape=(1, 28, 28), traces=True)
+# 兴奋层
+exc_layer = LIFNodes(n=n_neurons, traces=True, theta_plus=theta_plus)
+# 抑制层
+inh_layer = LIFNodes(n=n_neurons, traces=True)
+
+# 添加层到网络
+network.add_layer(input_layer, name="X")
+network.add_layer(exc_layer, name="E")
+network.add_layer(inh_layer, name="I")
+
+# 输入层到兴奋层的连接（可学习）
+input_exc_conn = Connection(
+    source=input_layer,
+    target=exc_layer,
+    w=0.3 * torch.rand(784, n_neurons),
+    update_rule=SpatialLearningRule,
+    nu=1e-2,
+    wmin=0.0,
+    wmax=1.0,
+    input_shape=(28, 28),
+    output_shape=(10, 10),
+    window=10,
+    neighbor_radius=1,
+    tau=1.0
 )
+network.add_connection(input_exc_conn, source="X", target="E")
+
+# 兴奋层到抑制层的连接（固定强抑制）
+exc_inh_conn = Connection(
+    source=exc_layer,
+    target=inh_layer,
+    w=exc * torch.eye(n_neurons),
+    update_rule=None,
+)
+network.add_connection(exc_inh_conn, source="E", target="I")
+
+# 抑制层到兴奋层的连接（全连接，固定强抑制）
+inh_exc_conn = Connection(
+    source=inh_layer,
+    target=exc_layer,
+    w=-inh * (torch.ones(n_neurons, n_neurons) - torch.eye(n_neurons)),
+    update_rule=None,
+)
+network.add_connection(inh_exc_conn, source="I", target="E")
+
+if gpu:
+    network.to("cuda")
+
 
 # Directs network to GPU
 if gpu:
@@ -130,10 +176,10 @@ accuracy = {"all": [], "proportion": []}
 
 # Voltage recording for excitatory and inhibitory layers.
 exc_voltage_monitor = Monitor(
-    network.layers["Ae"], ["v"], time=int(time / dt), device=device
+    network.layers["E"], ["v"], time=int(time / dt), device=device
 )
 inh_voltage_monitor = Monitor(
-    network.layers["Ai"], ["v"], time=int(time / dt), device=device
+    network.layers["I"], ["v"], time=int(time / dt), device=device
 )
 network.add_monitor(exc_voltage_monitor, name="exc_voltage")
 network.add_monitor(inh_voltage_monitor, name="inh_voltage")
@@ -255,7 +301,7 @@ for epoch in range(n_epochs):
         network.run(inputs=inputs, time=time)
 
         # Add to spikes recording.
-        s = spikes["Ae"].get("s").permute((1, 0, 2))
+        s = spikes["E"].get("s").permute((1, 0, 2))
         spike_record[
             (step * batch_size)
             % update_interval : (step * batch_size % update_interval)
@@ -271,7 +317,7 @@ for epoch in range(n_epochs):
             image = batch["image"][:, 0].view(28, 28)
             inpt = inputs["X"][:, 0].view(time, 784).sum(0).view(28, 28)
             lable = batch["label"][0]
-            input_exc_weights = network.connections[("X", "Ae")].w
+            input_exc_weights = network.connections[("X", "E")].w
             square_weights = get_square_weights(
                 input_exc_weights.view(784, n_neurons), n_sqrt, 28
             )
@@ -279,7 +325,7 @@ for epoch in range(n_epochs):
             spikes_ = {
                 layer: spikes[layer].get("s")[:, 0].contiguous() for layer in spikes
             }
-            voltages = {"Ae": exc_voltages, "Ai": inh_voltages}
+            voltages = {"E": exc_voltages, "I": inh_voltages}
             inpt_axes, inpt_ims = plot_input(
                 image, inpt, label=lable, axes=inpt_axes, ims=inpt_ims
             )
@@ -346,7 +392,7 @@ for step, batch in enumerate(test_dataloader):
     network.run(inputs=inputs, time=time)
 
     # Add to spikes recording.
-    spike_record = spikes["Ae"].get("s").permute((1, 0, 2))
+    spike_record = spikes["E"].get("s").permute((1, 0, 2))
 
     # Convert the array of labels into a tensor
     label_tensor = torch.tensor(batch["label"], device=device)

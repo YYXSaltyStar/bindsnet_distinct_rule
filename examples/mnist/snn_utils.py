@@ -142,7 +142,7 @@ class SpatialLearningRule(LearningRule):
                                         # 邻域增强
                                         for y, x in neighbor_region_coords:
                                             idx = y * self.input_shape[1] + x
-                                            delta_w[idx, j] += self.nu[0] * 0.5 / len(neighbor_region_coords)
+                                            delta_w[idx, j] += self.nu[0] * 0.01 / len(neighbor_region_coords)
 
         # 权重更新
         w += delta_w
