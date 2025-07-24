@@ -23,7 +23,7 @@ from bindsnet.evaluation import all_activity, assign_labels, proportion_weightin
 from bindsnet.models import DiehlAndCook2015
 from bindsnet.network.monitors import Monitor
 from bindsnet.utils import get_square_assignments, get_square_weights
-
+from snn_utils import CombinedSpatialPostPre, DiehlAndCook2015_with_SPL
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--n_neurons", type=int, default=100)
@@ -92,7 +92,7 @@ n_sqrt = int(np.ceil(np.sqrt(n_neurons)))
 start_intensity = intensity
 
 # Build network.
-network = DiehlAndCook2015(
+network = DiehlAndCook2015_with_SPL(
     n_inpt=784,
     n_neurons=n_neurons,
     exc=exc,
