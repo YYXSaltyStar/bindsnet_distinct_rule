@@ -71,7 +71,7 @@ class CombinedSpatialPostPre(PostPre):
         # 存储空间学习规则所需的参数
         self.input_shape = kwargs.get('input_shape', (28, 28))
         self.output_shape = kwargs.get('output_shape', (10, 10))
-        self.window = kwargs.get('window', 10)
+        self.window = kwargs.get('window', 5)
         self.neighbor_radius = kwargs.get('neighbor_radius', 1)
         self.tau = kwargs.get('tau', 1.0)
         # 确保设备正确设置
@@ -98,7 +98,7 @@ class CombinedSpatialPostPre(PostPre):
 
     def get_input_coordinates(self, pre_y: int, pre_x: int) -> list:
         """
-        获取输出层上一个神经元对应的输入层区域矩阵坐标。
+        获取输出层上的一个神经元对应的输入层区域矩阵坐标。
 
         :param pre_y: 输出层的y坐标
         :param pre_x: 输出层的x坐标
@@ -211,9 +211,12 @@ class CombinedSpatialPostPre(PostPre):
                                 )
                                 post_times = (post_spikes[t:t+self.window, :] > 0).nonzero(as_tuple=True)[0]
                                 if len((neighbor_pre_spikes > 0).nonzero(as_tuple=True)[0]) > 0 and len(post_times) > 0:
-                                    for j in range(N_post):
-                                        # 使用专门的空间学习率
-                                        delta_w_spatial[n_idx, j] += self.nu_spatial * 0.05 / len(neighbor_region_coords)
+                                    # for j in range(N_post):
+                                    #     # 使用专门的空间学习率
+                                    post_y, post_x = self.convert_input_to_E(ni, nj)
+                                    post_idx = post_y * self.output_shape[1] + post_x
+                                    delta_w_spatial[n_idx, post_idx] += self.nu_spatial * 0.001 / len(neighbor_region_coords)
+
         
         #步骤C: 组合并应用更新
         # 将两种更新量相加并应用到连接权重上
